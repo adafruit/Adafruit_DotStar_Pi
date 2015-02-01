@@ -26,7 +26,8 @@
   (just the data -or- clock pin, or if their positions are swapped) are
   not protected.
 
-  Written by Phil Burgess for Adafruit Industries.
+  Written by Phil Burgess for Adafruit Industries, with contributions from
+  the open source community.
 
   Adafruit invests time and resources providing this open source code,
   please support Adafruit and open-source hardware by purchasing products
@@ -92,9 +93,6 @@ static struct spi_ioc_transfer xfer[3] = {
    .cs_change     = 0 }
 };
 
-// Bitbang requires throttle on clock set/clear to avoid outpacing strip
-#define TINYDELAY { volatile uint8_t x=2; while(x--); }
-
 typedef struct {             // Python object for DotStar strip
 	PyObject_HEAD
 	uint32_t numLEDs,    // Number of pixels in strip
@@ -103,6 +101,7 @@ typedef struct {             // Python object for DotStar strip
 	         bitrate;    // SPI clock speed if using hardware SPI
 	int      fd;         // File descriptor if using hardware SPI
 	uint8_t *pixels,     // -> pixel data
+	        *pBuf,       // -> temp buf for brightness-scaling w/SPI
 	         dataPin,    // Data pin # if bitbang SPI
 	         clockPin,   // Clock pin # if bitbang SPI
 	         brightness; // Global brightness setting
@@ -151,6 +150,7 @@ static PyObject *DotStar_new(
 			self->bitrate    = 8000000;
 			self->fd         = -1;
 			self->pixels     = pixels; // NULL if 0 pixels
+			self->pBuf       = NULL;   // alloc'd on 1st use
 			self->dataPin    = dPin;
 			self->clockPin   = cPin;
 			self->brightness = 0;
@@ -296,6 +296,13 @@ static PyObject *setPixelColor(DotStarObject *self, PyObject *arg) {
 	return Py_None;
 }
 
+// Bitbang requires throttle on clock set/clear to avoid outpacing strip
+static void clockPulse(uint32_t mask) {
+	*gpioSet = mask;
+	asm ("nop; nop; nop; nop; nop");
+	*gpioClr = mask;
+}
+
 // Private method.  Writes pixel data without brightness scaling.
 static void raw_write(DotStarObject *self, uint8_t *ptr, uint32_t len) {
 	if(self->fd >= 0) { // Hardware SPI
@@ -309,22 +316,19 @@ static void raw_write(DotStarObject *self, uint8_t *ptr, uint32_t len) {
 		unsigned char byte, bit;
 		*gpioClr = self->dataMask;
 		for(bit=0; bit<32; bit++) { // Header
-			*gpioSet = self->clockMask; TINYDELAY
-			*gpioClr = self->clockMask; TINYDELAY
+			clockPulse(self->clockMask);
 		}
 		while(len--) {
 			byte = *ptr++;
 			for(bit = 0x80; bit; bit >>= 1) {
 				if(byte & bit) *gpioSet = self->dataMask;
 				else           *gpioClr = self->dataMask;
-				*gpioSet = self->clockMask; TINYDELAY
-				*gpioClr = self->clockMask; TINYDELAY
+				clockPulse(self->clockMask);
 			}
 		}
 		*gpioClr = self->dataMask;
 		for(bit=0; bit<32; bit++) { // Footer
-			*gpioSet = self->clockMask; TINYDELAY
-			*gpioClr = self->clockMask; TINYDELAY
+			clockPulse(self->clockMask);
 		}
 	}
 }
@@ -347,22 +351,51 @@ static PyObject *show(DotStarObject *self, PyObject *arg) {
 			uint8_t *ptr   = self->pixels;
 			uint16_t scale = self->brightness;
 			if(self->fd >= 0) { // Hardware SPI
-				uint8_t x[4];
-				x[0] = 0xFF;
-				write(self->fd, &xfer[0], sizeof(xfer[0]));
-				for(i=0; i<self->numLEDs; i++, ptr += 4) {
-					x[1] = (ptr[1] * scale) >> 8;
-					x[2] = (ptr[2] * scale) >> 8;
-					x[3] = (ptr[3] * scale) >> 8;
-					write(self->fd, &x, sizeof(x));
+				// Allocate pBuf if using hardware
+				// SPI and not previously alloc'd
+				if((self->pBuf == NULL) && ((self->pBuf =
+				  (uint8_t *)malloc(self->numLEDs * 4)))) {
+					memset(self->pBuf, 0xFF,
+					  self->numLEDs * 4); // Init MSBs
 				}
-				write(self->fd, &xfer[2], sizeof(xfer[2]));
+
+				if(self->pBuf) {
+					// Scale from 'pixels' buffer into
+					// 'pBuf' (if available) and then
+					// use a single efficient write
+					// operation (thx Eric Bayer).
+					uint8_t *pb = self->pBuf;
+					for(i=0; i<self->numLEDs;
+					  i++, ptr += 4, pb += 4) {
+						pb[1] = (ptr[1] * scale) >> 8;
+						pb[2] = (ptr[2] * scale) >> 8;
+						pb[3] = (ptr[3] * scale) >> 8;
+					}
+					raw_write(self, self->pBuf,
+					  self->numLEDs * 4);
+				} else {
+					// Fallback if pBuf not available
+					// (just in case malloc fails),
+					// also write() bugfix via Eric Bayer
+					uint8_t x[4];
+					x[0] = 0xFF;
+					write(self->fd, &header,
+					  sizeof(header));
+					for(i=0; i<self->numLEDs;
+					  i++, ptr += 4) {
+						x[1] = (ptr[1] * scale) >> 8;
+						x[2] = (ptr[2] * scale) >> 8;
+						x[3] = (ptr[3] * scale) >> 8;
+						write(self->fd, &x, sizeof(x));
+					}
+					write(self->fd, &footer,
+					  sizeof(footer));
+				}
 			} else if(self->dataMask) {
 				uint32_t word, bit;
 				*gpioClr = self->dataMask;
 				for(bit=0; bit<32; bit++) { // Header
-					*gpioSet = self->clockMask; TINYDELAY
-					*gpioClr = self->clockMask; TINYDELAY
+					clockPulse(self->clockMask);
 				}
 				for(i=0; i<self->numLEDs; i++, ptr += 4) {
 					word = 0xFF000000                   |
@@ -375,15 +408,12 @@ static PyObject *show(DotStarObject *self, PyObject *arg) {
 						else
 						  *gpioClr = self->dataMask;
 						*gpioSet = self->clockMask;
-						TINYDELAY
-						*gpioClr = self->clockMask;
-						TINYDELAY
+						clockPulse(self->clockMask);
 					}
 				}
 				*gpioClr = self->dataMask;
 				for(bit=0; bit<32; bit++) { // Footer
-					*gpioSet = self->clockMask; TINYDELAY
-					*gpioClr = self->clockMask; TINYDELAY
+					clockPulse(self->clockMask);
 				}
 			}
 		}
@@ -467,6 +497,7 @@ static PyObject *_close(DotStarObject *self) {
 
 static void DotStar_dealloc(DotStarObject *self) {
 	_close(self);
+	if(self->pBuf)   free(self->pBuf);
 	if(self->pixels) free(self->pixels);
 	self->ob_type->tp_free((PyObject *)self);
 }
