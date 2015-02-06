@@ -57,11 +57,13 @@
 #include <linux/spi/spidev.h>
 
 // From GPIO example code by Dom and Gert van Loo on elinux.org:
-#define BCM2708_PERI_BASE 0x20000000
-#define GPIO_BASE         (BCM2708_PERI_BASE + 0x200000)
-#define BLOCK_SIZE        (4*1024)
-#define INP_GPIO(g)      *(gpio+((g)/10)) &= ~(7<<(((g)%10)*3))
-#define OUT_GPIO(g)      *(gpio+((g)/10)) |=  (1<<(((g)%10)*3))
+#define PI1_BCM2708_PERI_BASE 0x20000000
+#define PI1_GPIO_BASE         (PI1_BCM2708_PERI_BASE + 0x200000)
+#define PI2_BCM2708_PERI_BASE 0x3F000000
+#define PI2_GPIO_BASE         (PI2_BCM2708_PERI_BASE + 0x200000)
+#define BLOCK_SIZE            (4*1024)
+#define INP_GPIO(g)          *(gpio+((g)/10)) &= ~(7<<(((g)%10)*3))
+#define OUT_GPIO(g)          *(gpio+((g)/10)) |=  (1<<(((g)%10)*3))
 
 #define SPI_MOSI_PIN 10
 #define SPI_CLK_PIN  11
@@ -70,6 +72,8 @@ static volatile unsigned
   *gpio = NULL, // Memory-mapped GPIO peripheral
   *gpioSet,     // Write bitmask of GPIO pins to set here
   *gpioClr;     // Write bitmask of GPIO pins to clear here
+
+static uint8_t isPi2 = 0; // For clock pulse timing & stuff
 
 // SPI transfer operation setup.  These are only used w/hardware SPI
 // and LEDs at full brightness (or raw write); other conditions require
@@ -175,6 +179,59 @@ static int DotStar_init(DotStarObject *self, PyObject *arg) {
 	return 0;
 }
 
+// Detect Pi board type.  Doesn't return super-granular details,
+// just the most basic distinction needed for GPIO compatibility:
+// 0: Pi 1 Model B revision 1
+// 1: Pi 1 Model B revision 2, Model A, Model B+, Model A+
+// 2: Pi 2 Model B
+
+static int boardType(void) {
+	FILE *fp;
+	char  buf[1024], *ptr;
+	int   n, board = 1; // Assume Pi1 Rev2 by default
+
+	// Relies on info in /proc/cmdline.  If this becomes unreliable
+	// in the future, alt code below uses /proc/cpuinfo if any better.
+#if 1
+	if((fp = fopen("/proc/cmdline", "r"))) {
+		while(fgets(buf, sizeof(buf), fp)) {
+			if((ptr = strstr(buf, "mem_size=")) &&
+			   (sscanf(&ptr[9], "%x", &n) == 1) &&
+			   (n == 0x3F000000)) {
+				board = 2; // Appears to be a Pi 2
+				break;
+			} else if((ptr = strstr(buf, "boardrev=")) &&
+			          (sscanf(&ptr[9], "%x", &n) == 1) &&
+			          ((n == 0x02) || (n == 0x03))) {
+				board = 0; // Appears to be an early Pi
+				break;
+			}
+		}
+		fclose(fp);
+	}
+#else
+	char s[8];
+	if((fp = fopen("/proc/cpuinfo", "r"))) {
+		while(fgets(buf, sizeof(buf), fp)) {
+			if((ptr = strstr(buf, "Hardware")) &&
+			   (sscanf(&ptr[8], " : %7s", s) == 1) &&
+			   (!strcmp(s, "BCM2709"))) {
+				board = 2; // Appears to be a Pi 2
+				break;
+			} else if((ptr = strstr(buf, "Revision")) &&
+			          (sscanf(&ptr[8], " : %x", &n) == 1) &&
+			          ((n == 0x02) || (n == 0x03))) {
+				board = 0; // Appears to be an early Pi
+				break;
+			}
+		}
+		fclose(fp);
+	}
+#endif
+
+	return board;
+}
+
 // Initialize pins/SPI for output
 static PyObject *begin(DotStarObject *self) {
 	if(self->dataPin == 0xFF) { // Use hardware SPI
@@ -197,17 +254,21 @@ static PyObject *begin(DotStarObject *self) {
 	} else { // Use bitbang "soft" SPI (any 2 pins)
 		if(gpio == NULL) { // First time accessing GPIO?
 			int fd;
+
 			if((fd = open("/dev/mem", O_RDWR | O_SYNC)) < 0) {
 				printf("Can't open /dev/mem (try 'sudo')\n");
 				return NULL;
 			}
-			gpio = (volatile unsigned *)mmap( // Memory-map I/O
+			isPi2 = (boardType() == 2);
+			gpio  = (volatile unsigned *)mmap( // Memory-map I/O
 			  NULL,                 // Any adddress will do
 			  BLOCK_SIZE,           // Mapped block length
 			  PROT_READ|PROT_WRITE, // Enable read+write
 			  MAP_SHARED,           // Shared w/other processes
 			  fd,                   // File to map
-			  GPIO_BASE);           // Offset to GPIO registers
+			  isPi2 ?
+			   PI2_GPIO_BASE :      // -> GPIO registers
+			   PI1_GPIO_BASE);
 			close(fd);              // Not needed after mmap()
 			if(gpio == MAP_FAILED) {
 				err("Can't mmap()");
@@ -300,6 +361,13 @@ static PyObject *setPixelColor(DotStarObject *self, PyObject *arg) {
 static void clockPulse(uint32_t mask) {
 	*gpioSet = mask;
 	asm ("nop; nop; nop; nop; nop");
+	if(isPi2) {
+	  asm ("nop; nop; nop; nop; nop");
+	  asm ("nop; nop; nop; nop; nop");
+	  asm ("nop; nop; nop; nop; nop");
+	  asm ("nop; nop; nop; nop; nop");
+	  asm ("nop; nop; nop; nop; nop");
+        }
 	*gpioClr = mask;
 }
 
