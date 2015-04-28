@@ -151,7 +151,7 @@ static PyObject *DotStar_new(
 			self->numLEDs    = n_pixels;
 			self->dataMask   = 0;
 			self->clockMask  = 0;
-			self->bitrate    = 8000000;
+			self->bitrate    = bitrate;
 			self->fd         = -1;
 			self->pixels     = pixels; // NULL if 0 pixels
 			self->pBuf       = NULL;   // alloc'd on 1st use
