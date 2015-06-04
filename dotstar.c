@@ -582,7 +582,7 @@ static PyMethodDef methods[] = {
   { "getPixelColor", (PyCFunction)getPixelColor, METH_VARARGS, NULL },
   { "numPixels"    , (PyCFunction)numPixels    , METH_NOARGS , NULL },
   { "getBrightness", (PyCFunction)getBrightness, METH_NOARGS , NULL },
-  { "getPixels"    , (PyCFunction)getBrightness, METH_NOARGS , NULL },
+  { "getPixels"    , (PyCFunction)getPixels    , METH_NOARGS , NULL },
   { "close"        , (PyCFunction)_close       , METH_NOARGS , NULL },
   { NULL, NULL, 0, NULL }
 };
