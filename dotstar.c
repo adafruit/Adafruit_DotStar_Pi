@@ -26,6 +26,10 @@
   (just the data -or- clock pin, or if their positions are swapped) are
   not protected.
 
+  As of 9/15 this is using the empirical APA102 data format (rather than
+  the datasheet specification).  If it suddenly starts misbehaving with
+  new LEDs in the future, may be a hardware production change in the LEDs.
+
   Written by Phil Burgess for Adafruit Industries, with contributions from
   the open source community.
 
@@ -78,20 +82,19 @@ static uint8_t isPi2 = 0; // For clock pulse timing & stuff
 // SPI transfer operation setup.  These are only used w/hardware SPI
 // and LEDs at full brightness (or raw write); other conditions require
 // per-byte processing.  Explained further in the show() method.
-static uint8_t header[] = { 0x00, 0x00, 0x00, 0x00 },
-               footer[] = { 0xFF, 0xFF, 0xFF, 0xFF };
 static struct spi_ioc_transfer xfer[3] = {
- { .rx_buf        = 0,
-   .len           = sizeof(header),
+ { .tx_buf        = 0, // Header (zeros)
+   .rx_buf        = 0,
+   .len           = 4,
    .delay_usecs   = 0,
    .bits_per_word = 8,
    .cs_change     = 0 },
- { .rx_buf        = 0,
+ { .rx_buf        = 0, // Color payload
    .delay_usecs   = 0,
    .bits_per_word = 8,
    .cs_change     = 0 },
- { .rx_buf        = 0,
-   .len           = sizeof(footer),
+ { .tx_buf        = 0, // Footer (zeros)
+   .rx_buf        = 0,
    .delay_usecs   = 0,
    .bits_per_word = 8,
    .cs_change     = 0 }
@@ -146,6 +149,7 @@ static PyObject *DotStar_new(
 		return NULL;
 	}
 
+	// Allocate space for LED data:
 	if((!n_pixels) || ((pixels = (uint8_t *)malloc(n_pixels * 4)))) {
 		if((self = (DotStarObject *)type->tp_alloc(type, 0))) {
 			self->numLEDs    = n_pixels;
@@ -170,12 +174,10 @@ static PyObject *DotStar_new(
 
 // Initialize DotStar object
 static int DotStar_init(DotStarObject *self, PyObject *arg) {
-	uint8_t *ptr;
 	uint32_t i;
 	// Set first byte of each 4-byte pixel to 0xFF, rest to 0x00 (off)
-	for(ptr = self->pixels, i=0; i<self->numLEDs; i++) {
-		*ptr++ = 0xFF; *ptr++ = 0x00; *ptr++ = 0x00; *ptr++ = 0x00;
-	}
+	memset(self->pixels, 0, self->numLEDs * 4);
+	for(i=0; i<self->numLEDs; i++) self->pixels[i * 4] = 0xFF;
 	return 0;
 }
 
@@ -247,10 +249,6 @@ static PyObject *begin(DotStarObject *self) {
 		// that will not exceed the requested rate.
 		// e.g. 8 MHz request: 250 MHz / 32 = 7.8125 MHz.
 		ioctl(self->fd, SPI_IOC_WR_MAX_SPEED_HZ, self->bitrate);
-		xfer[0].tx_buf = (unsigned long)header;
-		xfer[2].tx_buf = (unsigned long)footer;
-		xfer[0].speed_hz = xfer[1].speed_hz = xfer[2].speed_hz =
-		  self->bitrate;
 	} else { // Use bitbang "soft" SPI (any 2 pins)
 		if(gpio == NULL) { // First time accessing GPIO?
 			int fd;
@@ -359,34 +357,43 @@ static PyObject *setPixelColor(DotStarObject *self, PyObject *arg) {
 
 // Bitbang requires throttle on clock set/clear to avoid outpacing strip
 static void clockPulse(uint32_t mask) {
+	volatile uint8_t hi, lo;
 	*gpioSet = mask;
-	asm ("nop; nop; nop; nop; nop");
 	if(isPi2) {
-	  asm ("nop; nop; nop; nop; nop");
-	  asm ("nop; nop; nop; nop; nop");
-	  asm ("nop; nop; nop; nop; nop");
-	  asm ("nop; nop; nop; nop; nop");
-	  asm ("nop; nop; nop; nop; nop");
-        }
+		hi = 60; // These were found empirically
+		lo = 50; // using 'Pi2' overclock setting and...
+	} else {
+		hi = 14; // ...'Medium' setting, respectively,
+		lo = 2;  // driving a 2 meter x 144 LED strip.
+	}
+	while(hi--);
 	*gpioClr = mask;
+	while(lo--);
 }
 
 // Private method.  Writes pixel data without brightness scaling.
 static void raw_write(DotStarObject *self, uint8_t *ptr, uint32_t len) {
 	if(self->fd >= 0) { // Hardware SPI
-		xfer[1].tx_buf = (unsigned long)ptr;
-		xfer[1].len    = len;
+		xfer[0].speed_hz = self->bitrate;
+		xfer[1].speed_hz = self->bitrate;
+		xfer[2].speed_hz = self->bitrate;
+		xfer[1].tx_buf   = (unsigned long)ptr;
+		xfer[1].len      = len;
+		if(self->numLEDs) xfer[2].len = (self->numLEDs + 15) / 16;
+		else              xfer[2].len = ((len / 4) + 15) / 16;
 		// All that spi_ioc_transfer struct stuff earlier in
 		// the code is so we can use this single ioctl to concat
-		// the header/data/footer into one operation:
+		// the data & footer into one operation:
 		(void)ioctl(self->fd, SPI_IOC_MESSAGE(3), xfer);
 	} else if(self->dataMask) { // Bitbang
-		unsigned char byte, bit;
+		unsigned char byte, bit,
+		              headerLen = 32;
+		uint32_t      footerLen;
+		if(self->numLEDs) footerLen = (self->numLEDs + 1) / 2;
+		else              footerLen = ((len / 4) + 1) / 2;
 		*gpioClr = self->dataMask;
-		for(bit=0; bit<32; bit++) { // Header
-			clockPulse(self->clockMask);
-		}
-		while(len--) {
+		while(headerLen--) clockPulse(self->clockMask);
+		while(len--) { // Pixel data
 			byte = *ptr++;
 			for(bit = 0x80; bit; bit >>= 1) {
 				if(byte & bit) *gpioSet = self->dataMask;
@@ -395,16 +402,14 @@ static void raw_write(DotStarObject *self, uint8_t *ptr, uint32_t len) {
 			}
 		}
 		*gpioClr = self->dataMask;
-		for(bit=0; bit<32; bit++) { // Footer
-			clockPulse(self->clockMask);
-		}
+		while(footerLen--) clockPulse(self->clockMask);
 	}
 }
 
 // Issue data to strip.  Optional arg = raw bytearray to issue to strip
 // (else object's pixel buffer is used).  If passing raw data, it must
 // be in strip-ready format (4 bytes/pixel, 0xFF/B/G/R) and no brightness
-// scaling is performed...it's all about speed (for POV & stuff).
+// scaling is performed...it's all about speed (for POV, etc.)
 static PyObject *show(DotStarObject *self, PyObject *arg) {
 	if(PyTuple_Size(arg) == 1) { // Raw bytearray passed
 		Py_buffer buf;
@@ -446,25 +451,30 @@ static PyObject *show(DotStarObject *self, PyObject *arg) {
 					// (just in case malloc fails),
 					// also write() bugfix via Eric Bayer
 					uint8_t x[4];
+					// Header:
+					x[0] = 0;
+					i    = 4;
+					while(i--) write(self->fd, x, 1);
+					// Payload:
 					x[0] = 0xFF;
-					write(self->fd, &header,
-					  sizeof(header));
 					for(i=0; i<self->numLEDs;
 					  i++, ptr += 4) {
 						x[1] = (ptr[1] * scale) >> 8;
 						x[2] = (ptr[2] * scale) >> 8;
 						x[3] = (ptr[3] * scale) >> 8;
-						write(self->fd, &x, sizeof(x));
+						write(self->fd, x, sizeof(x));
 					}
-					write(self->fd, &footer,
-					  sizeof(footer));
+					// Footer:
+					x[0] = 0;
+					i = (self->numLEDs + 15) / 16;
+					while(i--) write(self->fd, x, 1);
 				}
 			} else if(self->dataMask) {
 				uint32_t word, bit;
+				// Header (32 bits)
 				*gpioClr = self->dataMask;
-				for(bit=0; bit<32; bit++) { // Header
-					clockPulse(self->clockMask);
-				}
+				bit      = 32;
+				while(bit--) clockPulse(self->clockMask);
 				for(i=0; i<self->numLEDs; i++, ptr += 4) {
 					word = 0xFF000000                   |
 					 (((ptr[1] * scale) & 0xFF00) << 8) |
@@ -475,14 +485,13 @@ static PyObject *show(DotStarObject *self, PyObject *arg) {
 						  *gpioSet = self->dataMask;
 						else
 						  *gpioClr = self->dataMask;
-						*gpioSet = self->clockMask;
 						clockPulse(self->clockMask);
 					}
 				}
+				// Footer (1/2 bit per LED)
 				*gpioClr = self->dataMask;
-				for(bit=0; bit<32; bit++) { // Footer
-					clockPulse(self->clockMask);
-				}
+				bit      = (self->numLEDs + 1) / 2;
+				while(bit--) clockPulse(self->clockMask);
 			}
 		}
 	}
