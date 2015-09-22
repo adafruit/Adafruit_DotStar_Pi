@@ -18,7 +18,7 @@ clockpin  = 24
 strip     = Adafruit_DotStar(numpixels, datapin, clockpin)
 
 # Alternate ways of declaring strip:
-# strip   = Adafruit_DotStar(numpixels)           # Use SPI (pins 11, 12)
+# strip   = Adafruit_DotStar(numpixels)           # Use SPI (pins 10=MOSI, 11=SCLK)
 # strip   = Adafruit_DotStar(numpixels, 32000000) # SPI @ ~32 MHz
 # strip   = Adafruit_DotStar()                    # SPI, No pixel buffer
 # strip   = Adafruit_DotStar(32000000)            # 32 MHz SPI, no pixel buf
