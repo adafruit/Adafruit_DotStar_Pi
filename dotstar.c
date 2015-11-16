@@ -111,7 +111,10 @@ typedef struct {             // Python object for DotStar strip
 	        *pBuf,       // -> temp buf for brightness-scaling w/SPI
 	         dataPin,    // Data pin # if bitbang SPI
 	         clockPin,   // Clock pin # if bitbang SPI
-	         brightness; // Global brightness setting
+	         brightness, // Global brightness setting
+	         rOffset,    // Index of red in 4-byte pixel
+	         gOffset,    // Index of green byte
+	         bOffset;    // Index of blue byte
 } DotStarObject;
 
 // Allocate new DotStar object.  There's a few ways this can be called:
@@ -125,7 +128,10 @@ static PyObject *DotStar_new(
   PyTypeObject *type, PyObject *arg, PyObject *kw) {
         DotStarObject *self     = NULL;
 	uint8_t       *pixels   = NULL, dPin = 0xFF, cPin = 0xFF;
-	uint32_t       n_pixels = 0, bitrate = 8000000;
+	uint32_t       n_pixels = 0, bitrate = 8000000, i;
+	PyObject      *string;
+	char          *order    = NULL, *c;
+	uint8_t        rOffset = 2, gOffset = 3, bOffset = 1; // BRG default
 
 	switch(PyTuple_Size(arg)) {
 	   case 3: // Pixel count, data pin, clock pin
@@ -149,6 +155,17 @@ static PyObject *DotStar_new(
 		return NULL;
 	}
 
+	// Can optionally append keyword to specify R/G/B pixel order
+	// "order='rgb'" or similar (switch r/g/b around to match strip).
+	// Order string isn't much validated; nonsense may occur.
+	if(kw && (string = PyDict_GetItemString(kw, "order")) &&
+	  (order = PyString_AsString(string))) {
+		for(i=0; order[i]; i++) order[i] = tolower(order[i]);
+		if((c = strchr(order, 'r'))) rOffset = c - order + 1;
+		if((c = strchr(order, 'g'))) gOffset = c - order + 1;
+		if((c = strchr(order, 'b'))) bOffset = c - order + 1;
+	}
+
 	// Allocate space for LED data:
 	if((!n_pixels) || ((pixels = (uint8_t *)malloc(n_pixels * 4)))) {
 		if((self = (DotStarObject *)type->tp_alloc(type, 0))) {
@@ -162,6 +179,9 @@ static PyObject *DotStar_new(
 			self->dataPin    = dPin;
 			self->clockPin   = cPin;
 			self->brightness = 0;
+			self->rOffset    = rOffset;
+			self->gOffset    = gOffset;
+			self->bOffset    = bOffset;
 			Py_INCREF(self);
 		} else if(pixels) {
 			free(pixels);
@@ -345,10 +365,10 @@ static PyObject *setPixelColor(DotStarObject *self, PyObject *arg) {
 	}
 
 	if(i < self->numLEDs) {
-		uint8_t *ptr = &self->pixels[i * 4 + 1];
-		*ptr++ = b; // Data internally is stored
-		*ptr++ = g; // in BGR order; it's what
-		*ptr++ = r; // the strip expects.
+		uint8_t *ptr = &self->pixels[i * 4];
+		ptr[self->rOffset] = r;
+		ptr[self->gOffset] = g;
+		ptr[self->bOffset] = b;
 	}
 
 	Py_INCREF(Py_None);
@@ -522,8 +542,10 @@ static PyObject *getPixelColor(DotStarObject *self, PyObject *arg) {
 	if(!PyArg_ParseTuple(arg, "I", &i)) return NULL;
 
 	if(i < self->numLEDs) {
-		uint8_t *ptr = &self->pixels[i * 4 + 1];
-		b = *ptr++; g = *ptr++; r = *ptr++;
+		uint8_t *ptr = &self->pixels[i * 4];
+		r = ptr[self->rOffset];
+		g = ptr[self->gOffset];
+		b = ptr[self->bOffset];
 	}
 
 	result = Py_BuildValue("I", (r << 16) | (g << 8) | b);

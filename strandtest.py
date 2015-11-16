@@ -23,6 +23,7 @@ strip     = Adafruit_DotStar(numpixels, datapin, clockpin)
 # strip   = Adafruit_DotStar()                    # SPI, No pixel buffer
 # strip   = Adafruit_DotStar(32000000)            # 32 MHz SPI, no pixel buf
 # See image-pov.py for explanation of no-pixel-buffer use.
+# Append "order='gbr'" to declaration for proper colors w/older DotStar strips)
 
 strip.begin()           # Initialize pins for output
 strip.setBrightness(64) # Limit brightness to ~1/4 duty cycle

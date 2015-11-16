@@ -19,6 +19,18 @@ strip     = Adafruit_DotStar(0, datapin, clockpin)
 # the DotStar module to NOT allocate any memory for this strip...we'll handle
 # our own allocation and conversion and will feed it 'raw' data.
 
+# So we'll write directly to the pixel data buffer.  Data is not necessarily
+# in RGB order -- current DotStars use BRG order, and older ones are GBR.
+# Additionally, byte 0 of each 4-byte pixel is always 0xFF, so the RGB
+# offsets are always in range 1-3.
+# Here's the offsets for current (2015+) strips:
+rOffset = 2
+gOffset = 3
+bOffset = 1
+# For older strips, change values to 3, 1, 2
+# This is ONLY necessary because we're raw-writing; for normal setPixelColor
+# use, offsets can be changed with the 'order' keyword (see strandtest.py).
+
 strip.begin()           # Initialize pins for output
 
 # Load image in RGB format and get dimensions:
@@ -51,9 +63,9 @@ for x in range(width):          # For each column of image...
 		value             = pixels[x, y]    # Read pixel in image
 		y4                = y * 4           # Position in raw buffer
 		column[x][y4]     = 0xFF            # Pixel start marker
-		column[x][y4 + 1] = gamma[value[2]] # Gamma-corrected blue
-		column[x][y4 + 2] = gamma[value[1]] # Gamma-corrected green
-		column[x][y4 + 3] = gamma[value[0]] # Gamma-corrected red
+		column[x][y4 + rOffset] = gamma[value[0]] # Gamma-corrected R
+		column[x][y4 + gOffset] = gamma[value[1]] # Gamma-corrected G
+		column[x][y4 + bOffset] = gamma[value[2]] # Gamma-corrected B
 
 print "Displaying..."
 while True:                            # Loop forever
