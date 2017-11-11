@@ -529,7 +529,7 @@ static PyObject *Color(DotStarObject *self, PyObject *arg) {
 	if(!PyArg_ParseTuple(arg, "bbb", &r, &g, &b)) return NULL;
 
 	result = Py_BuildValue("I", (r << 16) | (g << 8) | b);
-	Py_INCREF(result);
+	//Py_INCREF(result);
 	return result;
 }
 
