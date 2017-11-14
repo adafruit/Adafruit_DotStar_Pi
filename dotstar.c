@@ -183,13 +183,16 @@ static PyObject *DotStar_new(
 			self->gOffset    = gOffset;
 			self->bOffset    = bOffset;
 			Py_INCREF(self);
-		} else if(pixels) {
-			free(pixels);
+			return (PyObject *)self;
+		} else {
+			// 'self' failed to allocate --
+			// free pixel buffer if allocated.
+			if(pixels) free(pixels);
 		}
 	}
 
-	Py_INCREF(self);
-        return (PyObject *)self;
+	Py_INCREF(Py_None);
+	return Py_None;
 }
 
 // Initialize DotStar object
@@ -523,21 +526,17 @@ static PyObject *show(DotStarObject *self, PyObject *arg) {
 // Given separate R, G, B, return a packed 32-bit color.
 // Meh, mostly here for parity w/Arduino library.
 static PyObject *Color(DotStarObject *self, PyObject *arg) {
-	uint8_t   r, g, b;
-	PyObject *result;
+	uint8_t r, g, b;
 
 	if(!PyArg_ParseTuple(arg, "bbb", &r, &g, &b)) return NULL;
 
-	result = Py_BuildValue("I", (r << 16) | (g << 8) | b);
-	//Py_INCREF(result);
-	return result;
+	return Py_BuildValue("I", (r << 16) | (g << 8) | b);
 }
 
 // Return color of previously-set pixel (as packed 32-bit value)
 static PyObject *getPixelColor(DotStarObject *self, PyObject *arg) {
-	uint32_t  i;
-	uint8_t   r=0, g=0, b=0;
-	PyObject *result;
+	uint32_t i;
+	uint8_t  r=0, g=0, b=0;
 
 	if(!PyArg_ParseTuple(arg, "I", &i)) return NULL;
 
@@ -548,36 +547,27 @@ static PyObject *getPixelColor(DotStarObject *self, PyObject *arg) {
 		b = ptr[self->bOffset];
 	}
 
-	result = Py_BuildValue("I", (r << 16) | (g << 8) | b);
-	Py_INCREF(result);
-	return result;
+	return Py_BuildValue("I", (r << 16) | (g << 8) | b);
 }
 
 // Return strip length
 static PyObject *numPixels(DotStarObject *self) {
-	PyObject *result = Py_BuildValue("I", self->numLEDs);
-	Py_INCREF(result);
-	return result;
+	return Py_BuildValue("I", self->numLEDs);
 }
 
 // Return strip brightness
 static PyObject *getBrightness(DotStarObject *self) {
-	PyObject *result = Py_BuildValue("H", (uint8_t)(self->brightness - 1));
-	Py_INCREF(result);
-	return result;
+	return Py_BuildValue("H", (uint8_t)(self->brightness - 1));
 }
 
 // DON'T USE THIS.  One of those "parity with Arduino library" methods,
-// but current'y doesn't work (and might never).  Supposed to return strip's
+// but currently doesn't work (and might never).  Supposed to return strip's
 // pixel buffer, but doesn't seem to be an easy way to do this in Python 2.X.
 // That's okay -- instead of 'raw' access to a strip's previously-allocated
 // buffer, a Python program can instead allocate its own buffer and pass this
 // to the show() method, basically achieving the same thing and then some.
 static PyObject *getPixels(DotStarObject *self) {
-	PyObject *result = Py_BuildValue("s#",
-	  self->pixels, self->numLEDs * 4);
-	Py_INCREF(result);
-	return result;
+	return Py_BuildValue("s#", self->pixels, self->numLEDs * 4);
 }
 
 static PyObject *_close(DotStarObject *self) {
