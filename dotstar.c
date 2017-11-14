@@ -268,7 +268,7 @@ static PyObject *begin(DotStarObject *self) {
 		// frequency and the smallest power-of-two prescaler
 		// that will not exceed the requested rate.
 		// e.g. 8 MHz request: 250 MHz / 32 = 7.8125 MHz.
-		ioctl(self->fd, SPI_IOC_WR_MAX_SPEED_HZ, self->bitrate);
+		ioctl(self->fd, SPI_IOC_WR_MAX_SPEED_HZ, &self->bitrate);
 	} else { // Use bitbang "soft" SPI (any 2 pins)
 		if(gpio == NULL) { // First time accessing GPIO?
 			int fd;
