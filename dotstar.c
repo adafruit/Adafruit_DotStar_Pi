@@ -77,7 +77,8 @@ static volatile unsigned
   *gpioSet,     // Write bitmask of GPIO pins to set here
   *gpioClr;     // Write bitmask of GPIO pins to clear here
 
-static uint8_t isPi2 = 0; // For clock pulse timing & stuff
+static uint8_t  isPi2  = 0;    // For clock pulse timing & stuff
+static uint32_t bufsiz = 4096; // SPI buffer size
 
 // SPI transfer operation setup.  These are only used w/hardware SPI
 // and LEDs at full brightness (or raw write); other conditions require
@@ -272,6 +273,17 @@ static PyObject *begin(DotStarObject *self) {
 		// that will not exceed the requested rate.
 		// e.g. 8 MHz request: 250 MHz / 32 = 7.8125 MHz.
 		ioctl(self->fd, SPI_IOC_WR_MAX_SPEED_HZ, &self->bitrate);
+
+		// Get SPI buf size from /sys/module/spidev/parameters/bufsiz
+		// Default is 4096.  To change, edit /boot/cmdline.txt,
+		// adding spidev.bufsiz=xxxxx
+		FILE *fp;
+		char  buf[32];
+		int   n;
+		if((fp = fopen("/sys/module/spidev/parameters/bufsiz", "r"))) {
+			if(fscanf(fp, "%d", &n) == 1) bufsiz = n;
+			fclose(fp);
+		}
 	} else { // Use bitbang "soft" SPI (any 2 pins)
 		if(gpio == NULL) { // First time accessing GPIO?
 			int fd;
@@ -404,10 +416,29 @@ static void raw_write(DotStarObject *self, uint8_t *ptr, uint32_t len) {
 		xfer[1].len      = len;
 		if(self->numLEDs) xfer[2].len = (self->numLEDs + 15) / 16;
 		else              xfer[2].len = ((len / 4) + 15) / 16;
-		// All that spi_ioc_transfer struct stuff earlier in
-		// the code is so we can use this single ioctl to concat
-		// the data & footer into one operation:
-		(void)ioctl(self->fd, SPI_IOC_MESSAGE(3), xfer);
+		if((xfer[0].len + xfer[1].len + xfer[2].len) <= bufsiz) {
+			// All that spi_ioc_transfer struct stuff earlier
+			// in the code is so we can use this single ioctl
+			// to concat the data & footer into one operation:
+			(void)ioctl(self->fd, SPI_IOC_MESSAGE(3), xfer);
+		} else {
+			// BUT, if it's too big for the SPI buffer (bufsiz),
+			// the transfer must be broken up into smaller parts.
+			// Header:
+			(void)ioctl(self->fd, SPI_IOC_MESSAGE(1), &xfer[0]);
+			// Color payload:
+			uint32_t bytes_remaining = len;
+			while(bytes_remaining > 0) {
+				xfer[1].len = (bytes_remaining > bufsiz) ?
+				  bufsiz : bytes_remaining;
+				(void)ioctl(self->fd, SPI_IOC_MESSAGE(1),
+				  &xfer[1]);
+				bytes_remaining -= xfer[1].len;
+				xfer[1].tx_buf  += xfer[1].len;
+			}
+			// Footer:
+			(void)ioctl(self->fd, SPI_IOC_MESSAGE(1), &xfer[2]);
+		}
 	} else if(self->dataMask) { // Bitbang
 		unsigned char byte, bit,
 		              headerLen = 32;
