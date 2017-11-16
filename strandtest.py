@@ -13,15 +13,16 @@ from dotstar import Adafruit_DotStar
 numpixels = 30 # Number of LEDs in strip
 
 # Here's how to control the strip from any two GPIO pins:
-datapin   = 23
-clockpin  = 24
-strip     = Adafruit_DotStar(numpixels, datapin, clockpin)
+datapin  = 23
+clockpin = 24
+strip    = Adafruit_DotStar(numpixels, datapin, clockpin)
 
 # Alternate ways of declaring strip:
-# strip   = Adafruit_DotStar(numpixels)           # Use SPI (pins 10=MOSI, 11=SCLK)
-# strip   = Adafruit_DotStar(numpixels, 32000000) # SPI @ ~32 MHz
-# strip   = Adafruit_DotStar()                    # SPI, No pixel buffer
-# strip   = Adafruit_DotStar(32000000)            # 32 MHz SPI, no pixel buf
+#  Adafruit_DotStar(npix, dat, clk, 1000000) # Bitbang @ ~1 MHz
+#  Adafruit_DotStar(npix)                    # Use SPI (pins 10=MOSI, 11=SCLK)
+#  Adafruit_DotStar(npix, 32000000)          # SPI @ ~32 MHz
+#  Adafruit_DotStar()                        # SPI, No pixel buffer
+#  Adafruit_DotStar(32000000)                # 32 MHz SPI, no pixel buf
 # See image-pov.py for explanation of no-pixel-buffer use.
 # Append "order='gbr'" to declaration for proper colors w/older DotStar strips)
 

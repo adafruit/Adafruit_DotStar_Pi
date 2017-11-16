@@ -3,11 +3,15 @@
 
 all: dotstar.so
 
+CFLAGS=-Ofast -fomit-frame-pointer \
+ -I/opt/vc/include \
+ -L/opt/vc/lib
+
 dotstar.so: dotstar.o
-	gcc -s -shared -Wl,-soname,libdotstar.so -o $@ $<
+	gcc -s -shared -Wl,-soname,libdotstar.so,-L/opt/vc/lib,-lbcm_host -o $@ $<
 
 .c.o:
-	gcc -fPIC -O3 -fomit-frame-pointer -funroll-loops -c $<
+	gcc $(CFLAGS) -c $<
 
 clean:
 	rm -f dotstar.o dotstar.so

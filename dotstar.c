@@ -59,15 +59,12 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <linux/spi/spidev.h>
+#include <bcm_host.h>
 
-// From GPIO example code by Dom and Gert van Loo on elinux.org:
-#define PI1_BCM2708_PERI_BASE 0x20000000
-#define PI1_GPIO_BASE         (PI1_BCM2708_PERI_BASE + 0x200000)
-#define PI2_BCM2708_PERI_BASE 0x3F000000
-#define PI2_GPIO_BASE         (PI2_BCM2708_PERI_BASE + 0x200000)
-#define BLOCK_SIZE            (4*1024)
-#define INP_GPIO(g)          *(gpio+((g)/10)) &= ~(7<<(((g)%10)*3))
-#define OUT_GPIO(g)          *(gpio+((g)/10)) |=  (1<<(((g)%10)*3))
+#define GPIO_BASE   0x200000
+#define BLOCK_SIZE  (4*1024)
+#define INP_GPIO(g) *(gpio+((g)/10)) &= ~(7<<(((g)%10)*3))
+#define OUT_GPIO(g) *(gpio+((g)/10)) |=  (1<<(((g)%10)*3))
 
 #define SPI_MOSI_PIN 10
 #define SPI_CLK_PIN  11
@@ -77,7 +74,6 @@ static volatile unsigned
   *gpioSet,     // Write bitmask of GPIO pins to set here
   *gpioClr;     // Write bitmask of GPIO pins to clear here
 
-static uint8_t  isPi2  = 0;    // For clock pulse timing & stuff
 static uint32_t bufsiz = 4096; // SPI buffer size
 
 // SPI transfer operation setup.  These are only used w/hardware SPI
@@ -101,12 +97,68 @@ static struct spi_ioc_transfer xfer[3] = {
    .cs_change     = 0 }
 };
 
+// -------------------------------------------------------------------------
+
+// In order to maintain consistent(ish) bitbang timing, the clock
+// scaling governor is set to turbo mode at the start of a write
+// operation, then restored to its original state afterward.
+// MBOXfd must be open to /dev/vcio before using this.
+
+#define MAJOR_NUM 100
+#define IOCTL_MBOX_PROPERTY _IOWR(MAJOR_NUM, 0, char *)
+
+static int     MBOXfd    = -1;
+static uint8_t turboSave = 0;
+
+void turboOn() {
+	if(MBOXfd >= 0) {          // MBOXfd open?
+		unsigned p[8];     // Property buffer
+		// Issue 'get turbo' request
+		p[0] = sizeof p;   // Buffer size in bytes
+		p[1] = 0x00000000; // 0 = process request
+		p[2] = 0x00030009; // Tag identifier: get turbo state
+		p[3] = 8;          // Value buffer size in bytes
+		p[4] = 0;          // Request
+		p[5] = 0;          // Clock ID (must be 0)
+		p[6] = 0;          // Unused in request (used for result)
+		p[7] = 0x00000000; // End tag
+		if((ioctl(MBOXfd, IOCTL_MBOX_PROPERTY, p) >= 0) &&
+		   (p[1] == 0x80000000)) { // Request successful
+			// Save value & issue 'set turbo' request
+			turboSave = p[6];
+			p[1] = 0x00000000; // 0 = process request
+			p[2] = 0x00038009; // Tag identifier: set turbo state
+			p[4] = 0;          // Request
+			p[6] = 1;          // Turbo state
+			ioctl(MBOXfd, IOCTL_MBOX_PROPERTY, p);
+		}
+	}
+}
+
+// Set scaling governor back to pre-turboOn() state
+void turboRestore() {
+	if(MBOXfd >= 0) {
+		unsigned p[8];
+		p[0] = sizeof p;   // Buffer size in bytes
+		p[1] = 0x00000000; // 0 = process request
+		p[2] = 0x00038009; // Tag identifier: set turbo state
+		p[3] = 8;          // Value buffer size in bytes
+		p[4] = 0;          // Request
+		p[5] = 0;          // Clock ID (must be 0)
+		p[6] = turboSave;  // Turbo state
+		p[7] = 0x00000000; // End tag
+		ioctl(MBOXfd, IOCTL_MBOX_PROPERTY, p);
+	}
+}
+
+// -------------------------------------------------------------------------
+
 typedef struct {             // Python object for DotStar strip
 	PyObject_HEAD
 	uint32_t numLEDs,    // Number of pixels in strip
 	         dataMask,   // Data pin bitmask if using bitbang SPI
 	         clockMask,  // Clock pin bitmask if bitbang SPI
-	         bitrate;    // SPI clock speed if using hardware SPI
+	         bitrate;    // SPI clock speed (or bitbang target speed)
 	int      fd;         // File descriptor if using hardware SPI
 	uint8_t *pixels,     // -> pixel data
 	        *pBuf,       // -> temp buf for brightness-scaling w/SPI
@@ -116,10 +168,12 @@ typedef struct {             // Python object for DotStar strip
 	         rOffset,    // Index of red in 4-byte pixel
 	         gOffset,    // Index of green byte
 	         bOffset;    // Index of blue byte
+	uint16_t t0, t1, t2; // Clock pulse timing
 } DotStarObject;
 
 // Allocate new DotStar object.  There's a few ways this can be called:
-// x = Adafruit_DotStar(nleds, datapin, clockpin)       Bitbang output
+// x = Adafruit_DotStar(nleds, datapin, clockpin)          Bitbang output
+// x = Adafruit_DotStar(nleds, datapin, clockpin, bitrate) " @ bitrate
 // x = Adafruit_DotStar(nleds, bitrate)   Use hardware SPI @ bitrate
 // x = Adafruit_DotStar(nleds)            Hardware SPI @ default rate
 // x = Adafruit_DotStar()                 0 LEDs, HW SPI, default rate
@@ -135,6 +189,15 @@ static PyObject *DotStar_new(
 	uint8_t        rOffset = 2, gOffset = 3, bOffset = 1; // BRG default
 
 	switch(PyTuple_Size(arg)) {
+	   case 4: // Pixel count, data pin, clock pin, bitrate
+		if(!PyArg_ParseTuple(arg, "IbbI", &n_pixels, &dPin, &cPin,
+		  &bitrate))
+			return NULL;
+		// If pins happen to correspond to hardware SPI data and
+		// clock, hardware SPI is used instead.  Because reasons.
+		if((dPin == SPI_MOSI_PIN) && (cPin  == SPI_CLK_PIN))
+			dPin = cPin = 0xFF;
+		break;
 	   case 3: // Pixel count, data pin, clock pin
 		if(!PyArg_ParseTuple(arg, "Ibb", &n_pixels, &dPin, &cPin))
 			return NULL;
@@ -205,64 +268,15 @@ static int DotStar_init(DotStarObject *self, PyObject *arg) {
 	return 0;
 }
 
-// Detect Pi board type.  Doesn't return super-granular details,
-// just the most basic distinction needed for GPIO compatibility:
-// 0: Pi 1 Model B revision 1
-// 1: Pi 1 Model B revision 2, Model A, Model B+, Model A+
-// 2: Pi 2 Model B
-
-static int boardType(void) {
-	FILE *fp;
-	char  buf[1024], *ptr;
-	int   n, board = 1; // Assume Pi1 Rev2 by default
-
-	// Relies on info in /proc/cmdline.  If this becomes unreliable
-	// in the future, alt code below uses /proc/cpuinfo if any better.
-#if 1
-	if((fp = fopen("/proc/cmdline", "r"))) {
-		while(fgets(buf, sizeof(buf), fp)) {
-			if((ptr = strstr(buf, "mem_size=")) &&
-			   (sscanf(&ptr[9], "%x", &n) == 1) &&
-			   ((n == 0x3F000000) || (n == 0x40000000))) {
-				board = 2; // Appears to be a Pi 2
-				break;
-			} else if((ptr = strstr(buf, "boardrev=")) &&
-			          (sscanf(&ptr[9], "%x", &n) == 1) &&
-			          ((n == 0x02) || (n == 0x03))) {
-				board = 0; // Appears to be an early Pi
-				break;
-			}
-		}
-		fclose(fp);
-	}
-#else
-	char s[8];
-	if((fp = fopen("/proc/cpuinfo", "r"))) {
-		while(fgets(buf, sizeof(buf), fp)) {
-			if((ptr = strstr(buf, "Hardware")) &&
-			   (sscanf(&ptr[8], " : %7s", s) == 1) &&
-			   (!strcmp(s, "BCM2709"))) {
-				board = 2; // Appears to be a Pi 2
-				break;
-			} else if((ptr = strstr(buf, "Revision")) &&
-			          (sscanf(&ptr[8], " : %x", &n) == 1) &&
-			          ((n == 0x02) || (n == 0x03))) {
-				board = 0; // Appears to be an early Pi
-				break;
-			}
-		}
-		fclose(fp);
-	}
-#endif
-
-	return board;
-}
+// For bitbang benchmarking
+static volatile uint8_t alarmFlag = 1;
+static void alarm_handler(int sig) { alarmFlag = 0; }
 
 // Initialize pins/SPI for output
 static PyObject *begin(DotStarObject *self) {
 	if(self->dataPin == 0xFF) { // Use hardware SPI
 		if((self->fd = open("/dev/spidev0.0", O_RDWR)) < 0) {
-			printf("Can't open /dev/spidev0.0 (try 'sudo')\n");
+			puts("Can't open /dev/spidev0.0 (try 'sudo')");
 			return NULL;
 		}
 		uint8_t mode = SPI_MODE_0 | SPI_NO_CS;
@@ -289,26 +303,50 @@ static PyObject *begin(DotStarObject *self) {
 			int fd;
 
 			if((fd = open("/dev/mem", O_RDWR | O_SYNC)) < 0) {
-				printf("Can't open /dev/mem (try 'sudo')\n");
+				puts("Can't open /dev/mem (try 'sudo')");
 				return NULL;
 			}
-			isPi2 = (boardType() == 2);
-			gpio  = (volatile unsigned *)mmap( // Memory-map I/O
+			gpio = (volatile unsigned *)mmap( // Memory-map I/O
 			  NULL,                 // Any adddress will do
 			  BLOCK_SIZE,           // Mapped block length
 			  PROT_READ|PROT_WRITE, // Enable read+write
 			  MAP_SHARED,           // Shared w/other processes
 			  fd,                   // File to map
-			  isPi2 ?
-			   PI2_GPIO_BASE :      // -> GPIO registers
-			   PI1_GPIO_BASE);
+			  bcm_host_get_peripheral_address() + GPIO_BASE);
 			close(fd);              // Not needed after mmap()
 			if(gpio == MAP_FAILED) {
-				err("Can't mmap()");
+				puts("Can't mmap()");
 				return NULL;
 			}
 			gpioSet = &gpio[7];
 			gpioClr = &gpio[10];
+
+			// Benchmark GPIO performance to get semi-
+			// deterministic-ish bitbang SPI timing.
+
+			MBOXfd = open("/dev/vcio", 0);
+			turboOn();
+
+			uint32_t         count;
+			struct itimerval timer;
+			timer.it_interval.tv_sec  = 0;
+			timer.it_interval.tv_usec = 0;
+			timer.it_value.tv_sec     = 0;
+			timer.it_value.tv_usec    = 250000; // 1/4 sec
+			signal(SIGALRM, alarm_handler);
+
+			setitimer(0, &timer, NULL); // 0 = Real time
+			for(alarmFlag=1, count=0; alarmFlag; count++)
+				*gpioSet = 0;
+
+			turboRestore();
+			count *= 4; // Number of GPIO write ops/sec
+
+			// GPIO register write cycles per bit
+			self->t2 = (count + (self->bitrate - 1)) /
+			  self->bitrate;
+			self->t0 = self->t2     / 4; // Raise clock
+			self->t1 = self->t2 * 3 / 4; // Lower clock
 		}
 
 		self->dataMask  = 1 << self->dataPin;
@@ -391,19 +429,11 @@ static PyObject *setPixelColor(DotStarObject *self, PyObject *arg) {
 }
 
 // Bitbang requires throttle on clock set/clear to avoid outpacing strip
-static void clockPulse(uint32_t mask) {
-	volatile uint8_t hi, lo;
-	*gpioSet = mask;
-	if(isPi2) {
-		hi = 60; // These were found empirically
-		lo = 50; // using 'Pi2' overclock setting and...
-	} else {
-		hi = 14; // ...'Medium' setting, respectively,
-		lo = 2;  // driving a 2 meter x 144 LED strip.
-	}
-	while(hi--);
-	*gpioClr = mask;
-	while(lo--);
+static void clockPulse(DotStarObject *d) {
+	uint16_t t=0;
+	while(t++ < d->t0) *gpioClr = d->clockMask; // Clock low
+	while(t++ < d->t1) *gpioSet = d->clockMask; // Clock high
+	while(t++ < d->t2) *gpioClr = d->clockMask; // Clock low
 }
 
 // Private method.  Writes pixel data without brightness scaling.
@@ -443,20 +473,22 @@ static void raw_write(DotStarObject *self, uint8_t *ptr, uint32_t len) {
 		unsigned char byte, bit,
 		              headerLen = 32;
 		uint32_t      footerLen;
+		turboOn();
 		if(self->numLEDs) footerLen = (self->numLEDs + 1) / 2;
 		else              footerLen = ((len / 4) + 1) / 2;
 		*gpioClr = self->dataMask;
-		while(headerLen--) clockPulse(self->clockMask);
+		while(headerLen--) clockPulse(self);
 		while(len--) { // Pixel data
 			byte = *ptr++;
 			for(bit = 0x80; bit; bit >>= 1) {
 				if(byte & bit) *gpioSet = self->dataMask;
 				else           *gpioClr = self->dataMask;
-				clockPulse(self->clockMask);
+				clockPulse(self);
 			}
 		}
 		*gpioClr = self->dataMask;
-		while(footerLen--) clockPulse(self->clockMask);
+		while(footerLen--) clockPulse(self);
+		turboRestore();
 	}
 }
 
@@ -525,10 +557,11 @@ static PyObject *show(DotStarObject *self, PyObject *arg) {
 				}
 			} else if(self->dataMask) {
 				uint32_t word, bit;
+				turboOn();
 				// Header (32 bits)
 				*gpioClr = self->dataMask;
 				bit      = 32;
-				while(bit--) clockPulse(self->clockMask);
+				while(bit--) clockPulse(self);
 				for(i=0; i<self->numLEDs; i++, ptr += 4) {
 					word = 0xFF000000                   |
 					 (((ptr[1] * scale) & 0xFF00) << 8) |
@@ -539,13 +572,14 @@ static PyObject *show(DotStarObject *self, PyObject *arg) {
 						  *gpioSet = self->dataMask;
 						else
 						  *gpioClr = self->dataMask;
-						clockPulse(self->clockMask);
+						clockPulse(self);
 					}
 				}
 				// Footer (1/2 bit per LED)
 				*gpioClr = self->dataMask;
 				bit      = (self->numLEDs + 1) / 2;
-				while(bit--) clockPulse(self->clockMask);
+				while(bit--) clockPulse(self);
+				turboRestore();
 			}
 		}
 	}
