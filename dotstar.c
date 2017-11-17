@@ -74,7 +74,8 @@ static volatile unsigned
   *gpioSet,     // Write bitmask of GPIO pins to set here
   *gpioClr;     // Write bitmask of GPIO pins to clear here
 
-static uint32_t bufsiz = 4096; // SPI buffer size
+static uint32_t _gwps,          // GPIO write ops/second
+                _bufsiz = 4096; // SPI buffer size
 
 // SPI transfer operation setup.  These are only used w/hardware SPI
 // and LEDs at full brightness (or raw write); other conditions require
@@ -295,7 +296,7 @@ static PyObject *begin(DotStarObject *self) {
 		char  buf[32];
 		int   n;
 		if((fp = fopen("/sys/module/spidev/parameters/bufsiz", "r"))) {
-			if(fscanf(fp, "%d", &n) == 1) bufsiz = n;
+			if(fscanf(fp, "%d", &n) == 1) _bufsiz = n;
 			fclose(fp);
 		}
 	} else { // Use bitbang "soft" SPI (any 2 pins)
@@ -327,7 +328,6 @@ static PyObject *begin(DotStarObject *self) {
 			MBOXfd = open("/dev/vcio", 0);
 			turboOn();
 
-			uint32_t         count;
 			struct itimerval timer;
 			timer.it_interval.tv_sec  = 0;
 			timer.it_interval.tv_usec = 0;
@@ -336,18 +336,17 @@ static PyObject *begin(DotStarObject *self) {
 			signal(SIGALRM, alarm_handler);
 
 			setitimer(0, &timer, NULL); // 0 = Real time
-			for(alarmFlag=1, count=0; alarmFlag; count++)
+			for(alarmFlag=1, _gwps=0; alarmFlag; _gwps++)
 				*gpioSet = 0;
 
+			_gwps *= 4; // Number of GPIO write ops/sec
 			turboRestore();
-			count *= 4; // Number of GPIO write ops/sec
-
-			// GPIO register write cycles per bit
-			self->t2 = (count + (self->bitrate - 1)) /
-			  self->bitrate;
-			self->t0 = self->t2     / 4; // Raise clock
-			self->t1 = self->t2 * 3 / 4; // Lower clock
 		}
+
+		// GPIO register write cycles per bit
+		self->t2 = (_gwps + (self->bitrate - 1)) / self->bitrate;
+		self->t0 = self->t2     / 4; // Raise clock
+		self->t1 = self->t2 * 3 / 4; // Lower clock
 
 		self->dataMask  = 1 << self->dataPin;
 		self->clockMask = 1 << self->clockPin;
@@ -431,9 +430,9 @@ static PyObject *setPixelColor(DotStarObject *self, PyObject *arg) {
 // Bitbang requires throttle on clock set/clear to avoid outpacing strip
 static void clockPulse(DotStarObject *d) {
 	uint16_t t=0;
-	while(t++ < d->t0) *gpioClr = d->clockMask; // Clock low
-	while(t++ < d->t1) *gpioSet = d->clockMask; // Clock high
-	while(t++ < d->t2) *gpioClr = d->clockMask; // Clock low
+	do { *gpioClr = d->clockMask; } while(++t < d->t0); // Clock low
+	do { *gpioSet = d->clockMask; } while(++t < d->t1); // Clock high
+	do { *gpioClr = d->clockMask; } while(++t < d->t2); // Clock low
 }
 
 // Private method.  Writes pixel data without brightness scaling.
@@ -446,21 +445,21 @@ static void raw_write(DotStarObject *self, uint8_t *ptr, uint32_t len) {
 		xfer[1].len      = len;
 		if(self->numLEDs) xfer[2].len = (self->numLEDs + 15) / 16;
 		else              xfer[2].len = ((len / 4) + 15) / 16;
-		if((xfer[0].len + xfer[1].len + xfer[2].len) <= bufsiz) {
+		if((xfer[0].len + xfer[1].len + xfer[2].len) <= _bufsiz) {
 			// All that spi_ioc_transfer struct stuff earlier
 			// in the code is so we can use this single ioctl
 			// to concat the data & footer into one operation:
 			(void)ioctl(self->fd, SPI_IOC_MESSAGE(3), xfer);
 		} else {
-			// BUT, if it's too big for the SPI buffer (bufsiz),
+			// BUT, if it's too big for the SPI buffer (_bufsiz),
 			// the transfer must be broken up into smaller parts.
 			// Header:
 			(void)ioctl(self->fd, SPI_IOC_MESSAGE(1), &xfer[0]);
 			// Color payload:
 			uint32_t bytes_remaining = len;
 			while(bytes_remaining > 0) {
-				xfer[1].len = (bytes_remaining > bufsiz) ?
-				  bufsiz : bytes_remaining;
+				xfer[1].len = (bytes_remaining > _bufsiz) ?
+				  _bufsiz : bytes_remaining;
 				(void)ioctl(self->fd, SPI_IOC_MESSAGE(1),
 				  &xfer[1]);
 				bytes_remaining -= xfer[1].len;
