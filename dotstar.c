@@ -111,7 +111,9 @@ static struct spi_ioc_transfer xfer[3] = {
 static int     MBOXfd    = -1;
 static uint8_t turboSave = 0;
 
-void turboOn() {
+static void turboOn(void), turboRestore(void);
+
+static void turboOn(void) {
 	if(MBOXfd >= 0) {          // MBOXfd open?
 		unsigned p[8];     // Property buffer
 		// Issue 'get turbo' request
@@ -137,7 +139,7 @@ void turboOn() {
 }
 
 // Set scaling governor back to pre-turboOn() state
-void turboRestore() {
+static void turboRestore(void) {
 	if(MBOXfd >= 0) {
 		unsigned p[8];
 		p[0] = sizeof p;   // Buffer size in bytes
@@ -293,7 +295,6 @@ static PyObject *begin(DotStarObject *self) {
 		// Default is 4096.  To change, edit /boot/cmdline.txt,
 		// adding spidev.bufsiz=xxxxx
 		FILE *fp;
-		char  buf[32];
 		int   n;
 		if((fp = fopen("/sys/module/spidev/parameters/bufsiz", "r"))) {
 			if(fscanf(fp, "%d", &n) == 1) _bufsiz = n;
@@ -539,7 +540,7 @@ static PyObject *show(DotStarObject *self, PyObject *arg) {
 					// Header:
 					x[0] = 0;
 					i    = 4;
-					while(i--) write(self->fd, x, 1);
+					while(i--) (void)write(self->fd, x, 1);
 					// Payload:
 					x[0] = 0xFF;
 					for(i=0; i<self->numLEDs;
@@ -547,12 +548,13 @@ static PyObject *show(DotStarObject *self, PyObject *arg) {
 						x[1] = (ptr[1] * scale) >> 8;
 						x[2] = (ptr[2] * scale) >> 8;
 						x[3] = (ptr[3] * scale) >> 8;
-						write(self->fd, x, sizeof(x));
+						(void)write(self->fd, x,
+						  sizeof(x));
 					}
 					// Footer:
 					x[0] = 0;
 					i = (self->numLEDs + 15) / 16;
-					while(i--) write(self->fd, x, 1);
+					while(i--) (void)write(self->fd, x, 1);
 				}
 			} else if(self->dataMask) {
 				uint32_t word, bit;
